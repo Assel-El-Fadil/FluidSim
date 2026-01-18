@@ -10,7 +10,8 @@ const float PI = 3.14159265358979323846;
 const float FPS = 120.0;
 const float SCREENWIDTH = 700.0f;
 const float SCREENHEIGHT = 700.0f;
-const float MASS = 1.0f;
+const float MASS = 5.0f;
+const float RAD = 0.25f;
 
 const int NUM_PARTICLES = 500;
 const int NUM_ROWS = 5;
@@ -21,21 +22,18 @@ float gWindowHeight = SCREENHEIGHT;
 float gAspect = 1.0f;
 
 // Physics
-float posX = 0.0f, posY = 0.0f;
-float velX = 0.0f, velY = 0.0f;       // initial velocity
-float gravity = -5.0f;                // gravity force (units/sec^2)
-float bounceDamping = 0.9f;           // how much energy is kept on bounce
-float airDamping = 1.0f;            // slight drag for smoothness
+float gravity = -9.8f;                // gravity force (units/sec^2)
 
 float targetDensity = 10.0f;
 float pressureStiffness = 20.0f;
+float viscosityMultiplier = 0.5f;
 
 struct Particle {
     float x = 0.0f, y = 0.0f;
-    float vx = 1.0f, vy = 0.0f;
+    float vx = 0.0f, vy = 0.0f;
 };
 
-struct PressureForce {
+struct Force {
     float fx = 0.0f, fy = 0.0f;
 };
 
@@ -93,8 +91,8 @@ void draw() {
     }
 }
 
-void init_scene(int numParticles) {
-    /*for (int i = 0; i < numParticles; i++) {
+void init_scene(int numParticles, int numRows) {
+    for (int i = 0; i < numParticles; i++) {
         float spacing = BALL_RADIUS * 2.2f;
 
         float x = (i / numRows) * spacing - 0.5f;
@@ -105,29 +103,6 @@ void init_scene(int numParticles) {
 		p.x = x;
 		p.y = y;
 		particles.push_back(p);
-    }*/
-    particles.clear();
-    densities.clear();
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-
-    // Keep particles fully inside the window
-    std::uniform_real_distribution<float> distX(
-        -1.0f + BALL_RADIUS, 1.0f - BALL_RADIUS);
-    std::uniform_real_distribution<float> distY(
-        -1.0f + BALL_RADIUS, 1.0f - BALL_RADIUS);
-
-    // Small random initial velocities (helps break symmetry)
-    std::uniform_real_distribution<float> velDist(-0.1f, 0.1f);
-
-    for (int i = 0; i < numParticles; i++) {
-        Particle p;
-        p.x = distX(gen);
-        p.y = distY(gen);
-        p.vx = velDist(gen);
-        p.vy = velDist(gen);
-        particles.push_back(p);
     }
 }
 
@@ -140,20 +115,20 @@ void wall_collision(Particle& p)
 
     if (p.x + BALL_RADIUS > right) {
         p.x = right - BALL_RADIUS;
-        p.vx = -p.vx * bounceDamping;
+        p.vx = -p.vx;
     }
     else if (p.x - BALL_RADIUS < left) {
         p.x = left + BALL_RADIUS;
-        p.vx = -p.vx * bounceDamping;
+        p.vx = -p.vx;
     }
 
     if (p.y + BALL_RADIUS > top) {
         p.y = top - BALL_RADIUS;
-        p.vy = -p.vy * bounceDamping;
+        p.vy = -p.vy;
     }
     else if (p.y - BALL_RADIUS < bottom) {
         p.y = bottom + BALL_RADIUS;
-        p.vy = -p.vy * bounceDamping;
+        p.vy = -p.vy;
     }
 }
 
@@ -161,7 +136,6 @@ void wall_collision(Particle& p)
 void update_particles(float dt, GLFWwindow* window) {
     #pragma omp parallel for
     for (auto& p : particles) {
-        //p.vy += gravity * dt;          // apply gravity
         p.x += p.vx * dt;             // update position
         p.y += p.vy * dt;
 
@@ -170,21 +144,42 @@ void update_particles(float dt, GLFWwindow* window) {
 	}
 }
 
-float densitySmoothingKernel(float effectRadius, float dist) {
+static float densitySmoothingKernel(float effectRadius, float dist) {
 	float volume = PI * pow(effectRadius, 8.0f) / 4.0f;
-    float result = std::max(0.0f, effectRadius - dist);
+    float result = std::max(0.0f, effectRadius * effectRadius - dist * dist);
 	return pow(result, 3.0f)/volume;
 }
 
-float PressureSmoothingKernel(float effectRadius, float dist) {
+static float PressureSmoothingKernel(float effectRadius, float dist) {
     if (dist >= effectRadius) return 0.0f;
     float deriv = effectRadius - dist;
     float scale = -24.0f / (PI * pow(effectRadius, 8.0f));
-    return scale * dist * deriv * deriv;
+    return scale * deriv * deriv * deriv;
 }
 
-float DensityToPressure(float density) {
-    return pressureStiffness * (density - targetDensity);
+static float laplacienViscosityKernel(float effectradius, float dist) {
+    if (dist >= effectradius) return 0.0f;
+    float scale = 20.0f / (PI * pow(effectradius, 4.0f));
+	return scale * (effectradius - dist);
+}
+
+Force CalculateViscosity(int ind) {
+    Force viscosity;
+    for (int i = 0; i < particles.size(); i++) {
+        if (i == ind) continue;
+		Particle& pi = particles[ind];
+		Particle& pj = particles[i];
+		viscosity.fx += MASS * (pj.vx - pi.vx) / densities[i] * laplacienViscosityKernel(RAD, distance(pi, pj));
+		viscosity.fy += MASS * (pj.vy - pi.vy) / densities[i] * laplacienViscosityKernel(RAD, distance(pi, pj));
+    }
+	viscosity.fx *= viscosityMultiplier;
+	viscosity.fy *= viscosityMultiplier;
+	return viscosity;
+}
+
+static float DensityToPressure(float density) {
+    float p = pressureStiffness * (density - targetDensity);
+    return std::max(p, 0.0f);
 }
 
 void CalculateDensity(int ind) {
@@ -193,7 +188,7 @@ void CalculateDensity(int ind) {
     for (int i = 0; i < particles.size(); i++) {
         if (i == ind) continue;
 		float dist = distance(p, particles[i]);
-		float effect = densitySmoothingKernel(0.5f, dist);
+		float effect = densitySmoothingKernel(RAD, dist);
 		density += MASS * effect;
     }
 	densities.at(ind) = density;
@@ -207,8 +202,8 @@ void compute_densities() {
     }
 }
 
-PressureForce CalculatePressure(int i) {
-    PressureForce pressure;
+Force CalculatePressure(int i) {
+    Force pressure;
     Particle& pi = particles[i];
 
     float Pi = DensityToPressure(densities[i]);
@@ -220,21 +215,21 @@ PressureForce CalculatePressure(int i) {
 
         float dx = pi.x - pj.x;
         float dy = pi.y - pj.y;
-        float dist = sqrt(dx * dx + dy * dy);
+        float r = sqrt(dx * dx + dy * dy);
 
-        if (dist < 1e-5f || dist >= 0.5f) continue;
+        if (r < 1e-6f || r >= RAD) continue;
 
-        dx /= dist;
-        dy /= dist;
+        dx /= r;
+        dy /= r;
 
         float Pj = DensityToPressure(densities[j]);
-        float slope = PressureSmoothingKernel(0.5f, dist);
+        float grad = PressureSmoothingKernel(RAD, r);
 
         float coeff =
-            -MASS * MASS *
+            -MASS *
             (Pi / (densities[i] * densities[i]) +
                 Pj / (densities[j] * densities[j])) *
-            slope;
+            grad;
 
         pressure.fx += coeff * dx;
         pressure.fy += coeff * dy;
@@ -249,9 +244,15 @@ void updateSimulation(float dt, GLFWwindow* window) {
 
     #pragma omp parallel for
     for (int i = 0; i < particles.size(); i++) {
-        PressureForce pf = CalculatePressure(i);
-		particles[i].vx = pf.fx / MASS * dt;
-		particles[i].vy = pf.fy / MASS * dt;
+        Force pf = CalculatePressure(i);
+		Force vf = CalculateViscosity(i);
+
+        // SPH acceleration
+        float ax = pf.fx + vf.fx;
+        float ay = pf.fy + vf.fy + gravity;
+
+        particles[i].vx += ax * dt;
+        particles[i].vy += ay * dt;
     }
 
     update_particles(dt, window);
@@ -271,14 +272,14 @@ int main(void)
 
 	float lasttime=(float)glfwGetTime();
 	float currenttime;
-	init_scene(NUM_PARTICLES);
+	init_scene(NUM_PARTICLES, NUM_ROWS);
 
 	// --- Main loop ---
     while (!glfwWindowShouldClose(window))
     {   
 		currenttime = (float)glfwGetTime();
         float dt = (float)(currenttime-lasttime);
-        dt = std::min(dt, 1.0f / FPS);
+        dt = 0.001f;
 		lasttime = currenttime;
 
         // --- Physics ---
